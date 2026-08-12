@@ -20,7 +20,6 @@
 SQLServerMCP/
 ├── index.js             # MCP 服务器主程序（入口）
 ├── config.json          # 连接配置（编辑这里改数据库）
-├── config.example.json  # 配置示例
 ├── test-connection.js   # 独立连接测试脚本（不经过 MCP）
 ├── package.json
 └── node_modules/
