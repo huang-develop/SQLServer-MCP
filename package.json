@@ -1,0 +1,23 @@
+{
+  "name": "sqlserver-mcp",
+  "version": "1.0.0",
+  "description": "MCP 服务器：连接本地 SQL Server，支持任意 SQL 操作",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "test-connection": "node test-connection.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "agent-base": "^9.0.0",
+    "http-proxy-agent": "^9.1.0",
+    "https-proxy-agent": "^9.1.0",
+    "msnodesqlv8": "^5.2.3",
+    "mssql": "^11.0.1",
+    "zod": "^3.24.0"
+  }
+}
