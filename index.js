@@ -36,11 +36,15 @@ function log(...args) {
 /** 统一提取错误信息（msnodesqlv8 的错误 message 可能是对象） */
 function fmtErr(e) {
   if (!e) return String(e);
-  if (typeof fmtErr(e) === 'object' && fmtErr(e) !== null) {
-    try { return JSON.stringify(fmtErr(e)); } catch (err) { return String(fmtErr(e)); }
+  if (typeof e === 'string') return e;
+  if (e instanceof Error) {
+    const m = e.message;
+    return typeof m === 'object' ? JSON.stringify(m) : String(m || e);
   }
-  if (typeof fmtErr(e) === 'string') return fmtErr(e);
-  try { return JSON.stringify(e); } catch (err) { return String(e); }
+  if (typeof e === 'object') {
+    try { return JSON.stringify(e); } catch (_) { return String(e); }
+  }
+  try { return JSON.stringify(e); } catch (_) { return String(e); }
 }
 
 // ---------------- 配置加载 ----------------
