@@ -43,10 +43,15 @@ function loadConfig() {
       args[k] = idx === -1 ? true : a.slice(idx + 1);
     }
   });
-  const boolArg = (k) => {
-    const v = args[k];
-    if (v === undefined || v === true) return v === true;
-    return String(v).toLowerCase() === 'true';
+  const boolValue = (argName, envName, fileValue, defaultValue) => {
+    const value = args[argName] !== undefined
+      ? args[argName]
+      : env[envName] !== undefined
+        ? env[envName]
+        : fileValue !== undefined
+          ? fileValue
+          : defaultValue;
+    return value === true || String(value).toLowerCase() === 'true';
   };
   return {
     server: args.server || env.SQLSERVER_SERVER || fileCfg.server || 'localhost',
@@ -55,11 +60,11 @@ function loadConfig() {
     database: args.database || env.SQLSERVER_DATABASE || fileCfg.database || 'master',
     user: args.user || env.SQLSERVER_USER || fileCfg.user || 'sa',
     password: args.password || env.SQLSERVER_PASSWORD || fileCfg.password || '',
-    windowsAuth: boolArg('windowsAuth') || !!fileCfg.windowsAuth,
+    windowsAuth: boolValue('windowsAuth', 'SQLSERVER_WINDOWS_AUTH', fileCfg.windowsAuth, false),
     odbcDriver: args.odbcDriver || env.SQLSERVER_ODBC_DRIVER || fileCfg.odbcDriver || 'ODBC Driver 17 for SQL Server',
-    encrypt: args.encrypt !== undefined ? String(args.encrypt).toLowerCase() !== 'false' : fileCfg.encrypt !== undefined ? !!fileCfg.encrypt : true,
-    trustServerCertificate: true,
-    requestTimeout: 30000
+    encrypt: boolValue('encrypt', 'SQLSERVER_ENCRYPT', fileCfg.encrypt, true),
+    trustServerCertificate: boolValue('trustServerCertificate', 'SQLSERVER_TRUST_CERT', fileCfg.trustServerCertificate, true),
+    requestTimeout: parseInt(args.requestTimeout || env.SQLSERVER_TIMEOUT || fileCfg.requestTimeout || '30000', 10)
   };
 }
 
@@ -102,9 +107,9 @@ async function main() {
         ? `${cfg.server}\\${cfg.instanceName}`
         : `${cfg.server},${cfg.port}`;
       rawCfg.conn_str = [
-        `Driver={${cfg.odbcDriver}}`,
-        `Server=${serverPart}`,
-        `Database=${cfg.database}`,
+        `Driver={${String(cfg.odbcDriver).replace(/}/g, '}}')}}`,
+        `Server={${String(serverPart).replace(/}/g, '}}')}}`,
+        `Database={${String(cfg.database).replace(/}/g, '}}')}}`,
         'Trusted_Connection=Yes',
         `Encrypt=${cfg.encrypt ? 'Yes' : 'No'}`,
         `TrustServerCertificate=${cfg.trustServerCertificate ? 'Yes' : 'No'}`
@@ -116,6 +121,7 @@ async function main() {
   }
 
   const pool = await new driver.ConnectionPool(connCfg).connect();
+  pool.on('error', (e) => console.error('  连接池错误:', fmtErr(e)));
   try {
     const r = await pool.request().query('SELECT @@VERSION AS v, DB_NAME() AS db');
     const row = r.recordset[0];

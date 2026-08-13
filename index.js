@@ -17,6 +17,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
 const { z } = require('zod');
@@ -24,7 +25,11 @@ const mssql = require('mssql');
 
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 const DEFAULT_MAX_ROWS = 500;
-const SAFE_IDENT = /^[A-Za-z0-9_\[\]\s.\-]+$/;
+const MAX_SQL_LENGTH = 2 * 1024 * 1024;
+const MAX_REQUEST_TIMEOUT = 60 * 60 * 1000;
+const MAX_SCRIPT_BATCHES = 1000;
+const MAX_GO_REPEAT = 1000;
+const POOL_DRIVER = Symbol('sqlserverMcpDriver');
 
 // ---------------- 日志（写 stderr，避免污染 stdout 协议流） ----------------
 const DEBUG =
@@ -81,36 +86,94 @@ function loadConfig() {
 }
 
 function saveConfig(cfg) {
-  const { password, ...safe } = cfg;
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify({ ...safe, password: password || '' }, null, 2), 'utf8');
+  const tempPath = `${CONFIG_PATH}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(tempPath, JSON.stringify(cfg, null, 2), { encoding: 'utf8', mode: 0o600 });
+    fs.renameSync(tempPath, CONFIG_PATH);
+  } catch (e) {
+    try {
+      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+    } catch (_) {
+      // 保留原始写入异常
+    }
+    throw e;
+  }
 }
 
 function poolKey(cfg) {
-  return `${cfg.server}\\${cfg.instanceName}:${cfg.port}/${cfg.database}`;
+  return crypto
+    .createHash('sha256')
+    .update(JSON.stringify([
+      cfg.server,
+      cfg.port,
+      cfg.instanceName,
+      cfg.database,
+      cfg.user,
+      cfg.password,
+      cfg.windowsAuth,
+      cfg.odbcDriver,
+      cfg.encrypt,
+      cfg.trustServerCertificate,
+      cfg.requestTimeout
+    ]))
+    .digest('hex');
+}
+
+function validateConfig(cfg) {
+  const required = (name, value, max) => {
+    const text = String(value ?? '').trim();
+    if (!text) throw new Error(`${name} 不能为空`);
+    if (text.length > max || /[\0\r\n]/.test(text)) throw new Error(`${name} 格式非法`);
+    return text;
+  };
+  const optional = (name, value, max) => {
+    const text = String(value ?? '').trim();
+    if (text.length > max || /[\0\r\n]/.test(text)) throw new Error(`${name} 格式非法`);
+    return text;
+  };
+  const port = Number(cfg.port);
+  const requestTimeout = Number(cfg.requestTimeout);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('port 必须在 1-65535 之间');
+  if (!Number.isInteger(requestTimeout) || requestTimeout < 1 || requestTimeout > MAX_REQUEST_TIMEOUT) {
+    throw new Error(`requestTimeout 必须在 1-${MAX_REQUEST_TIMEOUT} 毫秒之间`);
+  }
+  return {
+    ...cfg,
+    server: required('server', cfg.server, 255),
+    port,
+    instanceName: optional('instanceName', cfg.instanceName, 128),
+    database: required('database', cfg.database, 128),
+    user: optional('user', cfg.user, 128),
+    password: String(cfg.password ?? ''),
+    odbcDriver: required('odbcDriver', cfg.odbcDriver, 255),
+    requestTimeout
+  };
+}
+
+function odbcValue(value) {
+  return `{${String(value).replace(/}/g, '}}')}}`;
 }
 
 function withDatabase(db) {
   const cfg = { ...currentConfig };
   if (db !== undefined && db !== null && db !== '') {
-    if (!SAFE_IDENT.test(String(db))) throw new Error('非法数据库名称: ' + db);
-    cfg.database = String(db).replace(/\[|\]/g, '');
+    let database = String(db).trim();
+    if (database.startsWith('[') && database.endsWith(']')) {
+      database = database.slice(1, -1).replace(/]]/g, ']');
+    }
+    cfg.database = database;
   }
-  return cfg;
+  return validateConfig(cfg);
 }
 
 // ---------------- 连接池管理 ----------------
 const pools = new Map(); // key -> ConnectionPool
+const pendingPools = new Map(); // key -> Promise<ConnectionPool>
+let poolGeneration = 0;
 
-async function getPool(cfg) {
-  const key = poolKey(cfg);
-  const existing = pools.get(key);
-  if (existing && existing.connected) return existing;
-  if (existing) {
-    try { await existing.close(); } catch (e) { log('关闭旧连接池失败:', fmtErr(e)); }
-    pools.delete(key);
-  }
-
-  log('创建连接池:', key);
+async function createPool(rawConfig, key, generation) {
+  const cfg = validateConfig(rawConfig);
+  log('创建连接池:', `${cfg.server}/${cfg.database}`);
   const server = cfg.instanceName ? `${cfg.server}\\${cfg.instanceName}` : cfg.server;
   const connCfg = {
     server,
@@ -141,9 +204,9 @@ async function getPool(cfg) {
         ? `${cfg.server}\\${cfg.instanceName}`
         : `${cfg.server},${cfg.port}`;
       rawCfg.conn_str = [
-        `Driver={${cfg.odbcDriver || 'ODBC Driver 17 for SQL Server'}}`,
-        `Server=${serverPart}`,
-        `Database=${cfg.database}`,
+        `Driver=${odbcValue(cfg.odbcDriver)}`,
+        `Server=${odbcValue(serverPart)}`,
+        `Database=${odbcValue(cfg.database)}`,
         'Trusted_Connection=Yes',
         `Encrypt=${cfg.encrypt ? 'Yes' : 'No'}`,
         `TrustServerCertificate=${cfg.trustServerCertificate ? 'Yes' : 'No'}`
@@ -155,16 +218,48 @@ async function getPool(cfg) {
   }
 
   const pool = new driver.ConnectionPool(connCfg);
+  Object.defineProperty(pool, POOL_DRIVER, { value: driver });
+  pool.on('error', (e) => {
+    log('连接池错误:', `${cfg.server}/${cfg.database}`, fmtErr(e));
+    if (key && pools.get(key) === pool) pools.delete(key);
+  });
   await pool.connect();
-  pools.set(key, pool);
+  if (key && generation !== poolGeneration) {
+    await pool.close();
+    throw new Error('连接配置已更新，请重试本次操作');
+  }
+  if (key) pools.set(key, pool);
   return pool;
 }
 
+async function getPool(rawConfig) {
+  const cfg = validateConfig(rawConfig);
+  const key = poolKey(cfg);
+  const existing = pools.get(key);
+  if (existing && existing.connected) return existing;
+  if (existing) {
+    try { await existing.close(); } catch (e) { log('关闭旧连接池失败:', fmtErr(e)); }
+    pools.delete(key);
+  }
+  if (pendingPools.has(key)) return pendingPools.get(key);
+  const generation = poolGeneration;
+  const pending = createPool(cfg, key, generation).finally(() => {
+    if (pendingPools.get(key) === pending) pendingPools.delete(key);
+  });
+  pendingPools.set(key, pending);
+  return pending;
+}
+
+function newRequest(pool, parent = pool) {
+  return new pool[POOL_DRIVER].Request(parent);
+}
+
 async function closeAllPools() {
-  for (const [key, pool] of pools) {
+  const entries = [...pools.entries()];
+  pools.clear();
+  for (const [key, pool] of entries) {
     try { await pool.close(); } catch (e) { log('关闭连接池失败:', key, fmtErr(e)); }
   }
-  pools.clear();
 }
 
 // ---------------- 返回格式辅助 ----------------
@@ -175,33 +270,98 @@ function err(text) {
   return { content: [{ type: 'text', text }], isError: true };
 }
 
-function formatRecordset(rs, maxRows) {
-  const total = rs.length;
-  return { rows: rs.slice(0, maxRows), truncated: total > maxRows, total };
+function errJson(obj) {
+  return { content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }], isError: true };
 }
 
-function formatQueryResult(result, maxRows, elapsedMs) {
+function formatQueryResult(result, elapsedMs) {
   const out = { elapsedMs };
-  // 多结果集（例如多条 SELECT 一起执行）
-  if (result.recordsets && result.recordsets.length > 1) {
-    out.resultsets = result.recordsets.map((rs) => formatRecordset(rs, maxRows));
+  if (result.recordsets.length > 1) {
+    out.resultsets = result.recordsets.map((rows, index) => ({
+      rows,
+      total: result.recordsetMeta[index].total,
+      truncated: result.recordsetMeta[index].truncated
+    }));
     return okJson(out);
   }
-  // 单结果集（SELECT）
-  if (result.recordset) {
-    const { rows, truncated, total } = formatRecordset(result.recordset, maxRows);
-    out.rows = rows;
-    out.rowCount = total;
-    if (truncated) {
+  if (result.recordsets.length === 1) {
+    const meta = result.recordsetMeta[0];
+    out.rows = result.recordsets[0];
+    out.rowCount = meta.total;
+    if (meta.truncated) {
       out.truncated = true;
-      out.message = `结果超过 ${maxRows} 行，已截断；可用 maxRows 参数调大上限（最大 10000）`;
+      out.message = '结果超过保留上限，响应已截断；可用 maxRows 参数调大上限（最大 10000）';
     }
     return okJson(out);
   }
-  // 非查询语句
   out.affected = (result.rowsAffected || []).reduce((a, b) => a + (b || 0), 0);
   out.message = '执行成功（非查询语句）';
   return okJson(out);
+}
+
+function executeStreamingQuery(req, sqlText, maxRows) {
+  return new Promise((resolve, reject) => {
+    const recordsets = [];
+    const recordsetMeta = [];
+    const rowsAffected = [];
+    let current = -1;
+    let settled = false;
+    const fail = (e) => {
+      if (settled) return;
+      settled = true;
+      reject(e);
+    };
+    req.stream = true;
+    req.on('recordset', () => {
+      current += 1;
+      recordsets[current] = [];
+      recordsetMeta[current] = { total: 0, truncated: false };
+    });
+    req.on('row', (row) => {
+      if (current < 0) {
+        current = 0;
+        recordsets[current] = [];
+        recordsetMeta[current] = { total: 0, truncated: false };
+      }
+      const meta = recordsetMeta[current];
+      meta.total += 1;
+      if (recordsets[current].length < maxRows) recordsets[current].push(row);
+      else meta.truncated = true;
+    });
+    req.on('rowsaffected', (count) => rowsAffected.push(count || 0));
+    req.on('error', fail);
+    req.on('done', (result) => {
+      if (settled) return;
+      settled = true;
+      resolve({
+        recordsets,
+        recordsetMeta,
+        rowsAffected: Array.isArray(result?.rowsAffected) ? result.rowsAffected : rowsAffected
+      });
+    });
+    req.query(sqlText, () => {});
+  });
+}
+
+function executeStreamingBatch(req, sqlText) {
+  return new Promise((resolve, reject) => {
+    const rowsAffected = [];
+    let settled = false;
+    const fail = (e) => {
+      if (settled) return;
+      settled = true;
+      reject(e);
+    };
+    req.stream = true;
+    req.on('rowsaffected', (count) => rowsAffected.push(count || 0));
+    req.on('error', fail);
+    req.on('done', (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(Array.isArray(result?.rowsAffected) ? result.rowsAffected : rowsAffected);
+    });
+    req.batch(sqlText, () => {});
+  });
 }
 
 function buildType(col) {
@@ -230,6 +390,8 @@ function splitBatches(sqlText) {
     const text = cur.join('\n').trim();
     cur = [];
     if (!text) return;
+    if (repeat > MAX_GO_REPEAT) throw new Error(`GO 重复次数不能超过 ${MAX_GO_REPEAT}`);
+    if (batches.length + repeat > MAX_SCRIPT_BATCHES) throw new Error(`脚本批次数不能超过 ${MAX_SCRIPT_BATCHES}`);
     for (let i = 0; i < repeat; i++) batches.push(text);
   };
   for (const line of lines) {
@@ -287,17 +449,17 @@ server.tool(
   'configure_connection',
   '修改 SQL Server 连接配置（server/port/instanceName/database/user/password 等）。设置后立即生效，下次数据库操作使用新配置；persist=true 时写入 config.json 永久保存。',
   {
-    server: z.string().optional().describe('服务器地址，如 localhost 或 192.168.1.10'),
-    port: z.number().int().positive().optional().describe('端口，默认 1433'),
-    instanceName: z.string().optional().describe('命名实例名，如 SQLEXPRESS'),
-    database: z.string().optional().describe('默认数据库，如 master'),
-    user: z.string().optional().describe('SQL 登录名'),
+    server: z.string().min(1).max(255).optional().describe('服务器地址，如 localhost 或 192.168.1.10'),
+    port: z.number().int().min(1).max(65535).optional().describe('端口，默认 1433'),
+    instanceName: z.string().max(128).optional().describe('命名实例名，如 SQLEXPRESS'),
+    database: z.string().min(1).max(128).optional().describe('默认数据库，如 master'),
+    user: z.string().max(128).optional().describe('SQL 登录名'),
     password: z.string().optional().describe('SQL 登录密码'),
     windowsAuth: z.boolean().optional().describe('是否使用 Windows 集成认证（需安装 msnodesqlv8）'),
-    odbcDriver: z.string().optional().describe('Windows 认证使用的 ODBC 驱动名，默认 "ODBC Driver 17 for SQL Server"'),
+    odbcDriver: z.string().min(1).max(255).optional().describe('Windows 认证使用的 ODBC 驱动名，默认 "ODBC Driver 17 for SQL Server"'),
     encrypt: z.boolean().optional().describe('是否加密连接，默认 true'),
     trustServerCertificate: z.boolean().optional().describe('是否信任服务器证书，默认 true'),
-    requestTimeout: z.number().int().positive().optional().describe('单条 SQL 超时毫秒数，默认 60000'),
+    requestTimeout: z.number().int().min(1).max(MAX_REQUEST_TIMEOUT).optional().describe('单条 SQL 超时毫秒数，默认 60000'),
     persist: z.boolean().optional().describe('是否写入 config.json 永久保存，默认 false')
   },
   async (args) => {
@@ -314,13 +476,15 @@ server.tool(
       if (args.encrypt !== undefined) next.encrypt = args.encrypt;
       if (args.trustServerCertificate !== undefined) next.trustServerCertificate = args.trustServerCertificate;
       if (args.requestTimeout !== undefined) next.requestTimeout = args.requestTimeout;
+      const validated = validateConfig(next);
+      if (args.persist) saveConfig(validated);
+      poolGeneration += 1;
+      currentConfig = validated;
       await closeAllPools();
-      currentConfig = next;
-      if (args.persist) saveConfig(next);
       return okJson({
         configured: true,
         persist: !!args.persist,
-        config: { ...next, password: next.password ? '******' : '' }
+        config: { ...validated, password: validated.password ? '******' : '' }
       });
     } catch (e) {
       return err('配置失败: ' + fmtErr(e));
@@ -407,7 +571,12 @@ server.tool(
              SELECT kcu.COLUMN_NAME
              FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
              JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
-               ON kcu.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+               ON kcu.CONSTRAINT_CATALOG = tc.CONSTRAINT_CATALOG
+              AND kcu.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
+              AND kcu.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+              AND kcu.TABLE_CATALOG = tc.TABLE_CATALOG
+              AND kcu.TABLE_SCHEMA = tc.TABLE_SCHEMA
+              AND kcu.TABLE_NAME = tc.TABLE_NAME
              WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
                AND kcu.TABLE_SCHEMA = @schema AND kcu.TABLE_NAME = @table
            ) pk ON pk.COLUMN_NAME = c.COLUMN_NAME
@@ -435,25 +604,29 @@ server.tool(
   'execute_query',
   '执行任意 SQL 语句（SELECT/INSERT/UPDATE/DELETE/DDL 等）。支持命名参数：SQL 中写 @name，params 传 { name: value }（键不需要 @ 前缀）。SELECT 返回行数据，非查询语句返回受影响行数。',
   {
-    sql: z.string().describe('要执行的 SQL 语句'),
+    sql: z.string().min(1).max(MAX_SQL_LENGTH).describe('要执行的 SQL 语句'),
     params: z
       .record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()]))
       .optional()
       .describe('命名参数，例如 { name: "张三", age: 30 }'),
     database: z.string().optional().describe('目标数据库名，默认当前连接数据库'),
     maxRows: z.number().int().positive().max(10000).optional().describe('SELECT 最多返回行数，默认 500'),
-    timeout: z.number().int().positive().optional().describe('超时毫秒数，默认 60000')
+    timeout: z.number().int().min(1).max(MAX_REQUEST_TIMEOUT).optional().describe('超时毫秒数，默认连接配置值')
   },
   async (args) => {
     const sqlText = String(args.sql || '').trim();
     if (!sqlText) return err('必须提供 sql 参数');
     const maxRows = args.maxRows || DEFAULT_MAX_ROWS;
+    let pool;
+    let temporaryPool = false;
     try {
-      const cfg = withDatabase(args.database);
-      const pool = await getPool(cfg);
-      const req = pool.request();
-      if (args.timeout) req.timeout = args.timeout;
+      const baseCfg = withDatabase(args.database);
+      const cfg = args.timeout ? { ...baseCfg, requestTimeout: args.timeout } : baseCfg;
+      temporaryPool = cfg.requestTimeout !== baseCfg.requestTimeout;
+      pool = temporaryPool ? await createPool(cfg) : await getPool(cfg);
+      const req = newRequest(pool);
       if (args.params) {
+        if (Object.keys(args.params).length > 200) return err('命名参数不能超过 200 个');
         for (const [k, v] of Object.entries(args.params)) {
           if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) return err(`非法参数名: ${k}`);
           if (v === null) req.input(k, mssql.NVarChar, null);
@@ -461,10 +634,14 @@ server.tool(
         }
       }
       const t0 = Date.now();
-      const result = await req.query(sqlText);
-      return formatQueryResult(result, maxRows, Date.now() - t0);
+      const result = await executeStreamingQuery(req, sqlText, maxRows);
+      return formatQueryResult(result, Date.now() - t0);
     } catch (e) {
       return err(`SQL 执行失败: ${fmtErr(e)}`);
+    } finally {
+      if (temporaryPool && pool) {
+        try { await pool.close(); } catch (e) { log('关闭临时连接池失败:', fmtErr(e)); }
+      }
     }
   }
 );
@@ -474,38 +651,74 @@ server.tool(
   'execute_script',
   '批量执行一段 SQL 脚本，支持多条语句与 GO 分隔符（按顺序执行，任一批次失败即停止并报告）。适合建表、初始化数据等场景。',
   {
-    sql: z.string().describe('SQL 脚本内容（多条语句用 ; 或 GO 分隔）'),
+    sql: z.string().min(1).max(MAX_SQL_LENGTH).describe('SQL 脚本内容（多条语句用 ; 或 GO 分隔）'),
     database: z.string().optional().describe('目标数据库名，默认当前连接数据库'),
-    timeout: z.number().int().positive().optional().describe('每个批次的超时毫秒数')
+    timeout: z.number().int().min(1).max(MAX_REQUEST_TIMEOUT).optional().describe('每个批次的超时毫秒数'),
+    atomic: z.boolean().optional().describe('是否使用事务保证全部成功或全部回滚，默认 true')
   },
   async (args) => {
     if (!args.sql || !String(args.sql).trim()) return err('必须提供 sql 参数');
+    let pool;
+    let transaction;
+    let transactionActive = false;
+    let temporaryPool = false;
+    const atomic = args.atomic !== false;
     try {
-      const cfg = withDatabase(args.database);
-      const pool = await getPool(cfg);
+      const baseCfg = withDatabase(args.database);
+      const cfg = args.timeout ? { ...baseCfg, requestTimeout: args.timeout } : baseCfg;
+      temporaryPool = cfg.requestTimeout !== baseCfg.requestTimeout;
+      pool = temporaryPool ? await createPool(cfg) : await getPool(cfg);
       const batches = splitBatches(args.sql);
       if (!batches.length) return err('脚本内容为空');
       const results = [];
       const t0 = Date.now();
+      if (atomic) {
+        transaction = new pool[POOL_DRIVER].Transaction(pool);
+        await transaction.begin();
+        transactionActive = true;
+      }
       for (let i = 0; i < batches.length; i++) {
-        const req = pool.request();
-        if (args.timeout) req.timeout = args.timeout;
+        const req = newRequest(pool, transactionActive ? transaction : pool);
         try {
-          const r = await req.batch(batches[i]);
+          const rowsAffected = await executeStreamingBatch(req, batches[i]);
           results.push({
             batch: i + 1,
             status: 'ok',
-            affected: (r.rowsAffected || []).reduce((a, b) => a + (b || 0), 0),
+            affected: rowsAffected.reduce((a, b) => a + (b || 0), 0),
             sql: truncateSql(batches[i])
           });
         } catch (e) {
           results.push({ batch: i + 1, status: 'error', message: fmtErr(e), sql: truncateSql(batches[i]) });
-          return okJson({ success: false, totalBatches: batches.length, elapsedMs: Date.now() - t0, results });
+          let rollbackError;
+          if (transactionActive) {
+            try { await transaction.rollback(); } catch (rollbackErr) { rollbackError = fmtErr(rollbackErr); }
+            transactionActive = false;
+          }
+          return errJson({
+            success: false,
+            rolledBack: atomic && !rollbackError,
+            partialApplied: !atomic && i > 0,
+            rollbackError,
+            totalBatches: batches.length,
+            elapsedMs: Date.now() - t0,
+            results
+          });
         }
       }
-      return okJson({ success: true, totalBatches: batches.length, elapsedMs: Date.now() - t0, results });
+      if (transactionActive) {
+        await transaction.commit();
+        transactionActive = false;
+      }
+      return okJson({ success: true, atomic, totalBatches: batches.length, elapsedMs: Date.now() - t0, results });
     } catch (e) {
+      if (transactionActive) {
+        try { await transaction.rollback(); } catch (rollbackErr) { log('回滚失败:', fmtErr(rollbackErr)); }
+      }
       return err('脚本执行失败: ' + fmtErr(e));
+    } finally {
+      if (temporaryPool && pool) {
+        try { await pool.close(); } catch (e) { log('关闭临时连接池失败:', fmtErr(e)); }
+      }
     }
   }
 );

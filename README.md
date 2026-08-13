@@ -11,8 +11,8 @@
 | `list_databases` | 列出实例上所有数据库 |
 | `list_tables` | 列出指定数据库的表（可含视图、指定架构） |
 | `describe_table` | 查看表结构：列、类型、可空、默认值、主键 |
-| `execute_query` | 执行任意 SQL，支持命名参数，SELECT 返回行数据（默认最多 500 行） |
-| `execute_script` | 批量执行 SQL 脚本，支持 `GO` 分隔符，失败即停并报告 |
+| `execute_query` | 执行任意 SQL，支持命名参数，流式接收 SELECT 结果（默认保留 500 行） |
+| `execute_script` | 批量执行 SQL 脚本，支持 `GO` 分隔符，默认使用事务、失败回滚 |
 
 ## 目录结构
 
@@ -36,7 +36,7 @@ npm install
 
 ### 2. 配置连接
 
-编辑 `config.json`：
+编辑本机的 `config.json`（该文件已被 Git 忽略，不应提交真实密码）：
 
 ```json
 {
@@ -94,10 +94,13 @@ node test-connection.js
 - 如果报 `SQL Server Native Client 11.0` 相关错误，说明本机没装该旧驱动，程序已自动改用 `odbcDriver` 指定的驱动（默认 `ODBC Driver 17 for SQL Server`），确认本机 ODBC 驱动名后可在配置中调整
 
 **查询结果被截断**
-- `execute_query` 默认最多返回 500 行，用 `maxRows` 参数调大（上限 10000）
+- `execute_query` 会流式读取结果，默认仅在内存和响应中保留每个结果集的前 500 行；用 `maxRows` 参数调大（上限 10000）
+- `timeout` 会使用具有对应请求超时的独立连接池，不会修改或复用错误超时的现有连接
 
 **多语句脚本**
-- 用 `execute_script` 执行，支持 `GO` 分隔符；任一批次失败会停止并报告出错批次
+- 用 `execute_script` 执行，支持 `GO` 分隔符；默认 `atomic=true`，任一批次失败会停止并回滚
+- `CREATE DATABASE` 等不允许在事务中执行的语句，可明确传入 `atomic=false`；此时失败前已完成的批次不会回滚
+- 单个 `GO` 的重复次数和脚本总批次数上限均为 1000
 
 ## 安全提示
 
