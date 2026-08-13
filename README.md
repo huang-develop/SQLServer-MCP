@@ -19,7 +19,7 @@
 ```
 SQLServerMCP/
 ├── index.js             # MCP 服务器主程序（入口）
-├── config.json          # 已初始化的连接配置（首次提交，后续本机修改不提交）
+├── config.json          # SQL Server 连接配置（不含真实密码）
 ├── test-connection.js   # 独立连接测试脚本（不经过 MCP）
 ├── package.json
 └── node_modules/
