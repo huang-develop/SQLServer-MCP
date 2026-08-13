@@ -16,7 +16,6 @@ const path = require('path');
 const mssql = require('mssql');
 
 const CONFIG_PATH = path.join(__dirname, 'config.json');
-const LOCAL_CONFIG_PATH = path.join(__dirname, 'config.local.json');
 
 /** 统一提取错误信息（msnodesqlv8 的错误 message 可能是对象） */
 function fmtErr(e) {
@@ -30,14 +29,10 @@ function fmtErr(e) {
 
 function loadConfig() {
   let fileCfg = {};
-  for (const configPath of [CONFIG_PATH, LOCAL_CONFIG_PATH]) {
-    try {
-      if (fs.existsSync(configPath)) {
-        fileCfg = { ...fileCfg, ...JSON.parse(fs.readFileSync(configPath, 'utf8')) };
-      }
-    } catch (e) {
-      // 忽略损坏或不存在的配置文件，继续使用其余配置来源
-    }
+  try {
+    fileCfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+  } catch (e) {
+    // 忽略：使用默认值
   }
   const env = process.env;
   const args = {};
