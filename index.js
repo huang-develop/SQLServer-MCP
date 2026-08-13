@@ -24,6 +24,7 @@ const { z } = require('zod');
 const mssql = require('mssql');
 
 const CONFIG_PATH = path.join(__dirname, 'config.json');
+const LOCAL_CONFIG_PATH = path.join(__dirname, 'config.local.json');
 const DEFAULT_MAX_ROWS = 500;
 const MAX_SQL_LENGTH = 2 * 1024 * 1024;
 const MAX_REQUEST_TIMEOUT = 60 * 60 * 1000;
@@ -55,12 +56,14 @@ function fmtErr(e) {
 // ---------------- 配置加载 ----------------
 function loadConfig() {
   let fileCfg = {};
-  try {
-    if (fs.existsSync(CONFIG_PATH)) {
-      fileCfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+  for (const configPath of [CONFIG_PATH, LOCAL_CONFIG_PATH]) {
+    try {
+      if (fs.existsSync(configPath)) {
+        fileCfg = { ...fileCfg, ...JSON.parse(fs.readFileSync(configPath, 'utf8')) };
+      }
+    } catch (e) {
+      console.error(`[SQLServerMCP] 解析 ${path.basename(configPath)} 失败:`, fmtErr(e));
     }
-  } catch (e) {
-    console.error('[SQLServerMCP] 解析 config.json 失败，使用默认配置:', fmtErr(e));
   }
   const env = process.env;
   const bool = (v, def) => {
@@ -86,10 +89,10 @@ function loadConfig() {
 }
 
 function saveConfig(cfg) {
-  const tempPath = `${CONFIG_PATH}.${process.pid}.${Date.now()}.tmp`;
+  const tempPath = `${LOCAL_CONFIG_PATH}.${process.pid}.${Date.now()}.tmp`;
   try {
     fs.writeFileSync(tempPath, JSON.stringify(cfg, null, 2), { encoding: 'utf8', mode: 0o600 });
-    fs.renameSync(tempPath, CONFIG_PATH);
+    fs.renameSync(tempPath, LOCAL_CONFIG_PATH);
   } catch (e) {
     try {
       if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
@@ -439,7 +442,7 @@ server.tool(
         config: cfgInfo
       });
     } catch (e) {
-      return err(`连接失败: ${fmtErr(e)}\n请先修改 config.json 或用 configure_connection 工具配置正确的连接信息。`);
+      return err(`连接失败: ${fmtErr(e)}\n请先修改 config.local.json、设置环境变量，或用 configure_connection 工具配置正确的连接信息。`);
     }
   }
 );
@@ -447,7 +450,7 @@ server.tool(
 // 2. 修改连接配置（运行时生效，可选持久化）
 server.tool(
   'configure_connection',
-  '修改 SQL Server 连接配置（server/port/instanceName/database/user/password 等）。设置后立即生效，下次数据库操作使用新配置；persist=true 时写入 config.json 永久保存。',
+  '修改 SQL Server 连接配置（server/port/instanceName/database/user/password 等）。设置后立即生效，下次数据库操作使用新配置；persist=true 时写入本机 config.local.json 永久保存。',
   {
     server: z.string().min(1).max(255).optional().describe('服务器地址，如 localhost 或 192.168.1.10'),
     port: z.number().int().min(1).max(65535).optional().describe('端口，默认 1433'),
@@ -460,7 +463,7 @@ server.tool(
     encrypt: z.boolean().optional().describe('是否加密连接，默认 true'),
     trustServerCertificate: z.boolean().optional().describe('是否信任服务器证书，默认 true'),
     requestTimeout: z.number().int().min(1).max(MAX_REQUEST_TIMEOUT).optional().describe('单条 SQL 超时毫秒数，默认 60000'),
-    persist: z.boolean().optional().describe('是否写入 config.json 永久保存，默认 false')
+    persist: z.boolean().optional().describe('是否写入本机 config.local.json 永久保存，默认 false')
   },
   async (args) => {
     try {

@@ -1,0 +1,13 @@
+{
+  "server": "localhost",
+  "port": 1433,
+  "instanceName": "",
+  "database": "master",
+  "user": "sa",
+  "password": "",
+  "windowsAuth": false,
+  "odbcDriver": "ODBC Driver 17 for SQL Server",
+  "encrypt": true,
+  "trustServerCertificate": true,
+  "requestTimeout": 60000
+}

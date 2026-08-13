@@ -19,7 +19,8 @@
 ```
 SQLServerMCP/
 ├── index.js             # MCP 服务器主程序（入口）
-├── config.json          # 连接配置（编辑这里改数据库）
+├── config.json          # 可提交的安全默认配置（不填写真实密码）
+├── config.local.json    # 本机私密配置（按需创建，Git 已忽略）
 ├── test-connection.js   # 独立连接测试脚本（不经过 MCP）
 ├── package.json
 └── node_modules/
@@ -36,7 +37,9 @@ npm install
 
 ### 2. 配置连接
 
-编辑本机的 `config.json`（该文件已被 Git 忽略，不应提交真实密码）：
+仓库已提供不含密码的 `config.json`，其他人拉取代码后可以直接看到完整配置结构。
+
+本机使用时，复制 `config.json` 为 `config.local.json`，然后只修改 `config.local.json`：
 
 ```json
 {
@@ -56,7 +59,11 @@ npm install
 
 > 提示：Windows 认证模式下，程序会自动改写连接串使用 `odbcDriver` 指定的驱动（mssql 默认的 `SQL Server Native Client 11.0` 在 Win 上常未安装）。若本机装的是 Driver 18，把这里改成 `ODBC Driver 18 for SQL Server` 即可。
 
+配置优先级为：环境变量 > `config.local.json` > `config.json` > 默认值。
+
 也可以用环境变量覆盖（优先级最高）：`SQLSERVER_SERVER`、`SQLSERVER_PORT`、`SQLSERVER_DATABASE`、`SQLSERVER_USER`、`SQLSERVER_PASSWORD`、`SQLSERVER_WINDOWS_AUTH` 等。
+
+`configure_connection` 使用 `persist=true` 时也只写入 `config.local.json`，不会把真实密码写进 Git 跟踪的 `config.json`。
 
 ### 3. 测试连接
 
